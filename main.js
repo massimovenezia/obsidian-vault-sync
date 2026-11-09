@@ -8,11 +8,14 @@ let obsidian = {};
 try { obsidian = require('obsidian'); } catch (e) { /* running under the Node test harness */ }
 const { Plugin, PluginSettingTab, Setting, Notice, Modal, Platform, requestUrl, debounce, TFile, TFolder } = obsidian;
 
-const DEFAULT_SERVER = 'https://life-agent.tailb2c60d.ts.net';
+const DEFAULT_SERVER = 'https://life-agent.tailb2c60d.ts.net:8765';
 const MASS_DELETE = 25;          // ask before a sync deletes more files than this
 const PARALLEL = 4;              // transfers at once
 const INTERVAL_MIN = 3;          // background sync every N minutes while open
 const EDIT_DELAY_MS = 8000;      // sync this long after the last edit
+const BATCH_FILE_MAX = 512 * 1024;   // files smaller than this download in batches...
+const BATCH_FILES = 150;             // ...of up to this many files
+const BATCH_BYTES = 4 * 1024 * 1024; // ...or this many bytes
 // Never synced: git internals and files that belong to one device. Same list as the server.
 const ALWAYS_IGNORE = [
   '.git/', '.trash/', '**/.DS_Store', '**/__pycache__/', '**/Thumbs.db', '**/desktop.ini',
@@ -97,6 +100,24 @@ function sha1js(bytes) {
   return [a, b, c, d, e].map((x) => (x >>> 0).toString(16).padStart(8, '0')).join('');
 }
 
+// Batch reply: per file a JSON header line {path, hash, size} (or {path, missing}) then <size> bytes.
+function parseBatch(buf) {
+  const bytes = new Uint8Array(buf);
+  const out = {};
+  const dec = new TextDecoder();
+  let pos = 0;
+  while (pos < bytes.length) {
+    let nl = pos;
+    while (nl < bytes.length && bytes[nl] !== 10) nl++;
+    const head = JSON.parse(dec.decode(bytes.subarray(pos, nl)));
+    pos = nl + 1;
+    if (head.missing) { out[head.path] = null; continue; }
+    out[head.path] = { hash: head.hash, data: bytes.slice(pos, pos + head.size).buffer };
+    pos += head.size;
+  }
+  return out;
+}
+
 async function pool(items, n, fn) {
   let i = 0;
   const workers = Array.from({ length: Math.min(n, items.length) }, async () => {
@@ -113,8 +134,8 @@ async function pool(items, n, fn) {
 // state: {seq, initialized, files: {path: {hash, size, mtime}}}
 
 class SyncEngine {
-  constructor({ fs, api, state, save, confirm, log }) {
-    Object.assign(this, { fs, api, state, save, confirm, log: log || (() => {}) });
+  constructor({ fs, api, state, save, confirm, log, progress }) {
+    Object.assign(this, { fs, api, state, save, confirm, log: log || (() => {}), progress: progress || (() => {}) });
     this.state.files = this.state.files || {};
     this.state.seq = this.state.seq || 0;
   }
@@ -147,7 +168,8 @@ class SyncEngine {
     const first = !this.state.initialized;
     const feed = await this.api.changes(first ? 0 : this.state.seq);
     const remote = {};
-    for (const c of feed.changes.sort((x, y) => x.seq - y.seq)) remote[c.path] = c.deleted ? null : c.hash;
+    const rsize = {};
+    for (const c of feed.changes.sort((x, y) => x.seq - y.seq)) { remote[c.path] = c.deleted ? null : c.hash; rsize[c.path] = c.size || 0; }
 
     const paths = new Set([...Object.keys(local), ...Object.keys(this.state.files), ...Object.keys(remote)]);
     const plan = [];
@@ -180,6 +202,14 @@ class SyncEngine {
       if (!ok) throw new Error(`stopped: ${deletions.length} deletions not confirmed`);
     }
 
+    // Small files first, so one big PDF on a slow link never holds up the notes.
+    const size = (x) => Math.max(rsize[x[1]] || 0, (local[x[1]] && local[x[1]].size) || 0);
+    plan.sort((a, b) => size(a) - size(b));
+    let done = 0;
+    let lastSave = Date.now();
+    const work = plan.filter((x) => x[0] !== 'record' && x[0] !== 'forget').length;
+    this.progress(0, work);
+
     const recordLocal = async (p, hash) => {
       const f = local[p] || {};
       this.state.files[p] = { hash, size: f.size, mtime: f.mtime };
@@ -195,6 +225,35 @@ class SyncEngine {
       this.state.files[p] = { hash: r.hash, size: s.size, mtime: s.mtime };
       st.down++;
     };
+    const tick = async () => {
+      this.progress(++done, work);
+      // Save what's done so far: an interrupted sync resumes instead of starting over.
+      if (Date.now() - lastSave > 5000) { lastSave = Date.now(); await this.save(); }
+    };
+
+    // Small downloads travel in batches (one round trip for up to 150 files): far-away phones
+    // would otherwise spend most of a first sync waiting on latency.
+    if (this.api.getMany) {
+      const small = plan.filter((x) => x[0] === 'download' && (rsize[x[1]] || 0) < BATCH_FILE_MAX);
+      const batches = [];
+      let cur = [], bytes = 0;
+      for (const x of small) {
+        if (cur.length && (cur.length >= BATCH_FILES || bytes + (rsize[x[1]] || 0) > BATCH_BYTES)) { batches.push(cur); cur = []; bytes = 0; }
+        cur.push(x[1]); bytes += rsize[x[1]] || 0;
+      }
+      if (cur.length) batches.push(cur);
+      await pool(batches, 2, async (paths) => {
+        const got = await this.api.getMany(paths);
+        for (const p of paths) {
+          const r = got[p];
+          if (!r) { if (await this.fs.exists(p)) await this.fs.remove(p); delete this.state.files[p]; }
+          else { const s = await this.fs.write(p, r.data); this.state.files[p] = { hash: r.hash, size: s.size, mtime: s.mtime }; st.down++; }
+          await tick();
+        }
+      });
+      const batched = new Set(small);
+      for (let i = plan.length - 1; i >= 0; i--) if (batched.has(plan[i])) plan.splice(i, 1);
+    }
 
     await pool(plan, PARALLEL, async ([op, p, base]) => {
       try {
@@ -222,6 +281,7 @@ class SyncEngine {
         this.log(`sync ${op} ${p} failed: ${e.message || e}`);
         throw e;
       }
+      if (op !== 'record' && op !== 'forget') await tick();
     });
 
     this.state.seq = feed.seq;
@@ -339,6 +399,10 @@ class ServerAPI {
     const data = r.arrayBuffer;
     return { data, hash: h ? h[1] : await gitHash(data) };
   }
+  async getMany(paths) {
+    const body = new TextEncoder().encode(JSON.stringify({ paths })).buffer;
+    return parseBatch((await this.req('/api/batch', {}, { method: 'POST', body })).arrayBuffer);
+  }
   async put(path, data, base, hash) {
     return (await this.req('/api/file', { path, base: base || '', hash }, { method: 'POST', body: data })).json;
   }
@@ -383,7 +447,7 @@ class VaultSyncPlugin extends (Plugin || class {}) {
 
     const soon = debounce(() => this.syncNow(false), EDIT_DELAY_MS, true);
     this.app.workspace.onLayoutReady(() => {
-      for (const ev of ['create', 'modify', 'delete', 'rename']) this.registerEvent(this.app.vault.on(ev, () => { if (!this.applying) soon(); }));
+      for (const ev of ['create', 'modify', 'delete', 'rename']) this.registerEvent(this.app.vault.on(ev, () => soon()));
       window.setTimeout(() => this.syncNow(false), 2000);
     });
     this.registerInterval(window.setInterval(() => this.syncNow(false), INTERVAL_MIN * 60 * 1000));
@@ -416,8 +480,8 @@ class VaultSyncPlugin extends (Plugin || class {}) {
         save: () => this.saveData(this.settings),
         confirm: (count, sample) => new Promise((resolve) => new ConfirmModal(this.app, count, sample, resolve).open()),
         log: (m) => console.log('[vault-sync] ' + m),
+        progress: (n, total) => { if (total) this.paint(`Syncing ${n}/${total}`); },
       });
-      this.applying = true;
       const r = await engine.sync();
       this.settings.lastSync = Date.now();
       this.settings.lastError = '';
@@ -431,7 +495,6 @@ class VaultSyncPlugin extends (Plugin || class {}) {
       this.settings.lastError = msg;
       await this.saveData(this.settings);
     } finally {
-      window.setTimeout(() => { this.applying = false; }, 500);
       this.running = false;
       this.paint();
       if (this.again) { this.again = false; window.setTimeout(() => this.syncNow(false), 1000); }
@@ -470,3 +533,4 @@ module.exports.gitHash = gitHash;
 module.exports.sha1js = sha1js;
 module.exports.compileIgnore = compileIgnore;
 module.exports.isIgnored = isIgnored;
+module.exports.parseBatch = parseBatch;

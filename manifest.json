@@ -1,7 +1,7 @@
 {
   "id": "vault-sync",
   "name": "Vault Sync",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "minAppVersion": "1.5.0",
   "description": "Syncs this vault with Massimo's Vault Sync server on the VPS (over Tailscale): Mac, PC and iPhones share one vault, and every change is committed to git.",
   "author": "Massimo Venezia",
