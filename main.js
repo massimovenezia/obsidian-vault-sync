@@ -357,15 +357,20 @@ class ObsidianFS {
     if (tf) await this.app.vault.delete(tf, true);
     else await this.adapter.remove(real);
     delete this.real[p];
-    // drop folders the delete left empty
-    let dir = real.split('/').slice(0, -1).join('/');
-    while (dir) {
-      const { files, folders } = await this.adapter.list(dir);
-      if (files.length || folders.length) break;
-      const tfd = this.app.vault.getAbstractFileByPath(dir);
-      if (tfd instanceof TFolder) await this.app.vault.delete(tfd, true); else await this.adapter.rmdir(dir, false);
-      dir = dir.split('/').slice(0, -1).join('/');
-    }
+    // Drop folders the delete left empty. Best effort: tidying must never fail a sync (several
+    // deletes in one folder run in parallel and race to remove it). On desktop, rmdir(dir, false)
+    // throws EISDIR even for an empty folder, so it's recursive, which is safe: we just saw it empty.
+    try {
+      let dir = real.split('/').slice(0, -1).join('/');
+      while (dir) {
+        if (!(await this.adapter.exists(dir))) break;
+        const { files, folders } = await this.adapter.list(dir);
+        if (files.length || folders.length) break;
+        const tfd = this.app.vault.getAbstractFileByPath(dir);
+        if (tfd instanceof TFolder) await this.app.vault.delete(tfd, true); else await this.adapter.rmdir(dir, true);
+        dir = dir.split('/').slice(0, -1).join('/');
+      }
+    } catch (e) { /* a parallel delete got there first, or the folder isn't empty after all */ }
   }
 }
 
