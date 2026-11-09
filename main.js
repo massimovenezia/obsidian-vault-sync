@@ -403,6 +403,9 @@ class ServerAPI {
     const body = new TextEncoder().encode(JSON.stringify({ paths })).buffer;
     return parseBatch((await this.req('/api/batch', {}, { method: 'POST', body })).arrayBuffer);
   }
+  async report(body) {
+    await this.req('/api/report', {}, { method: 'POST', body: new TextEncoder().encode(JSON.stringify(body)).buffer });
+  }
   async put(path, data, base, hash) {
     return (await this.req('/api/file', { path, base: base || '', hash }, { method: 'POST', body: data })).json;
   }
@@ -437,6 +440,7 @@ class VaultSyncPlugin extends (Plugin || class {}) {
     }
     this.running = false;
     this.again = false;
+    this.logs = [];
     this.status = this.addStatusBarItem();
     this.status.addClass('mod-clickable');
     this.status.onclick = () => this.syncNow(true);
@@ -467,6 +471,28 @@ class VaultSyncPlugin extends (Plugin || class {}) {
     this.status.setAttr('aria-label', s.lastError ? s.lastError : 'Vault Sync: click to sync now');
   }
 
+  note(line) {
+    this.logs.push(window.moment().format('YYYY-MM-DD HH:mm:ss') + ' ' + line);
+    if (this.logs.length > 50) this.logs.shift();
+    console.log('[vault-sync] ' + line);
+  }
+
+  // After every sync, tell the server what this device holds (version, errors, recent log, file
+  // hashes), so any device can be checked against the master from the VPS.
+  async sendReport() {
+    try {
+      const s = this.settings;
+      const files = {};
+      for (const [p, f] of Object.entries(s.sync.files || {})) files[p] = f.hash;
+      await this.api.report({
+        device: s.device, version: this.manifest.version,
+        platform: Platform.isIosApp ? 'ios' : Platform.isAndroidApp ? 'android' : Platform.isMacOS ? 'mac' : Platform.isWin ? 'windows' : 'other',
+        lastSync: s.lastSync ? new Date(s.lastSync).toISOString() : null, lastError: s.lastError,
+        seq: s.sync.seq, files, logs: this.logs,
+      });
+    } catch (e) { console.log('[vault-sync] report failed: ' + (e.message || e)); }
+  }
+
   async syncNow(manual) {
     if (!this.settings.enabled && !manual) return;
     if (this.running) { this.again = true; return; }
@@ -479,7 +505,7 @@ class VaultSyncPlugin extends (Plugin || class {}) {
         state: this.settings.sync,
         save: () => this.saveData(this.settings),
         confirm: (count, sample) => new Promise((resolve) => new ConfirmModal(this.app, count, sample, resolve).open()),
-        log: (m) => console.log('[vault-sync] ' + m),
+        log: (m) => this.note(m),
         progress: (n, total) => { if (total) this.paint(`Syncing ${n}/${total}`); },
       });
       const r = await engine.sync();
@@ -487,16 +513,19 @@ class VaultSyncPlugin extends (Plugin || class {}) {
       this.settings.lastError = '';
       await this.saveData(this.settings);
       const moved = r.up + r.down + r.delLocal + r.delRemote;
+      if (moved || r.conflicts.length || manual) this.note(`sync ok: up ${r.up}, down ${r.down}, deleted ${r.delLocal + r.delRemote}, merged ${r.merged}, conflicts ${r.conflicts.length}${r.conflicts.length ? ' (' + r.conflicts.join(', ') + ')' : ''}`);
       if (r.conflicts.length) new Notice(`Vault Sync: ${r.conflicts.length} conflict${r.conflicts.length > 1 ? 's' : ''}; both versions kept:\n${r.conflicts.join('\n')}`, 15000);
       else if (manual) new Notice(moved ? `Vault Sync: ↑${r.up} ↓${r.down}${r.delLocal + r.delRemote ? ` ✕${r.delLocal + r.delRemote}` : ''}${r.merged ? `, ${r.merged} merged` : ''}` : 'Vault Sync: up to date');
     } catch (e) {
       const msg = (e && e.message) || String(e);
+      this.note('sync failed: ' + msg);
       if (msg !== this.settings.lastError || manual) new Notice('Vault Sync: ' + msg + (/network|ERR_|failed to fetch|timed out|Load failed/i.test(msg) ? '\nIs Tailscale connected?' : ''), 10000);
       this.settings.lastError = msg;
       await this.saveData(this.settings);
     } finally {
       this.running = false;
       this.paint();
+      this.sendReport();
       if (this.again) { this.again = false; window.setTimeout(() => this.syncNow(false), 1000); }
     }
   }
